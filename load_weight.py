@@ -1,4 +1,4 @@
-from transformers import GPT2LMHeadModel
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
 import torch
 import torch.nn as nn
 import math
@@ -7,7 +7,7 @@ class FeedForward(nn.Module):
     def __init__(self, d_model, d_ff):
         super().__init__()
         self.W1 = nn.Linear(d_model, d_ff) # 升維
-        self.act = nn.GELU() # GPT-2 用 GELU，Transformer原論文用 ReLU
+        self.act = nn.GELU(approximate="tanh") # GPT-2 用 tanh 近似版 GELU，Transformer原論文用 ReLU
         self.W2 = nn.Linear(d_ff, d_model) # 降維
 
     def forward(self,x):
@@ -74,6 +74,7 @@ class GPT(nn.Module):
     def __init__(self, vocab_size, d_model, n_heads, n_layers, max_seq_len):
         super().__init__()
         d_ff=4*d_model
+        self.d_model=d_model
         self.token_emb=nn.Embedding(vocab_size,d_model)
         self.pos_emb=nn.Embedding(max_seq_len,d_model)
         self.blocks=nn.ModuleList([
@@ -104,41 +105,49 @@ hf_state_dict = hf_model.state_dict()
 #     print(name, tensor.shape)
 
 
+@torch.no_grad()
 def load_gpt2_weights(my_model, hf_state_dict, n_layer=12):
     sd = hf_state_dict
 
     # embedding
-    my_model.token_embedding.weight.data = sd["transformer.wte.weight"]
-    my_model.position_embedding.weight.data = sd["transformer.wpe.weight"]
+    my_model.token_emb.weight.copy_(sd["transformer.wte.weight"])
+    my_model.pos_emb.weight.copy_(sd["transformer.wpe.weight"])
 
     for i in range(n_layer):
         block = my_model.blocks[i]
         prefix = f"transformer.h.{i}."
 
         # LayerNorm
-        block.ln1.weight.data = sd[prefix + "ln_1.weight"]
-        block.ln1.bias.data   = sd[prefix + "ln_1.bias"]
-        block.ln2.weight.data = sd[prefix + "ln_2.weight"]
-        block.ln2.bias.data   = sd[prefix + "ln_2.bias"]
+        block.ln1.weight.copy_(sd[prefix + "ln_1.weight"])
+        block.ln1.bias.copy_(sd[prefix + "ln_1.bias"])
+        block.ln2.weight.copy_(sd[prefix + "ln_2.weight"])
+        block.ln2.bias.copy_(sd[prefix + "ln_2.bias"])
 
-        # Attention:c_attn / c_proj need transpose
-        block.attn.qkv_proj.weight.data = sd[prefix + "attn.c_attn.weight"].T
-        block.attn.qkv_proj.bias.data   = sd[prefix + "attn.c_attn.bias"]
-        block.attn.out_proj.weight.data = sd[prefix + "attn.c_proj.weight"].T
-        block.attn.out_proj.bias.data   = sd[prefix + "attn.c_proj.bias"]
+        # Attention: HF 用 Conv1D，權重是 (in, out)，要轉置成 nn.Linear 的 (out, in)
+        # c_attn 把 Q/K/V 合在一起 (768, 2304)，沿輸出維度切成三份
+        q_w, k_w, v_w = sd[prefix + "attn.c_attn.weight"].split(my_model.d_model, dim=1)
+        q_b, k_b, v_b = sd[prefix + "attn.c_attn.bias"].split(my_model.d_model, dim=0)
+        block.attn.W_q.weight.copy_(q_w.T)
+        block.attn.W_q.bias.copy_(q_b)
+        block.attn.W_k.weight.copy_(k_w.T)
+        block.attn.W_k.bias.copy_(k_b)
+        block.attn.W_v.weight.copy_(v_w.T)
+        block.attn.W_v.bias.copy_(v_b)
+        block.attn.W_o.weight.copy_(sd[prefix + "attn.c_proj.weight"].T)
+        block.attn.W_o.bias.copy_(sd[prefix + "attn.c_proj.bias"])
 
-        # FFN:c_fc / c_proj all need transpose
-        block.ffn.fc1.weight.data = sd[prefix + "mlp.c_fc.weight"].T
-        block.ffn.fc1.bias.data   = sd[prefix + "mlp.c_fc.bias"]
-        block.ffn.fc2.weight.data = sd[prefix + "mlp.c_proj.weight"].T
-        block.ffn.fc2.bias.data   = sd[prefix + "mlp.c_proj.bias"]
+        # FFN: c_fc / c_proj 也都要轉置
+        block.ffn.W1.weight.copy_(sd[prefix + "mlp.c_fc.weight"].T)
+        block.ffn.W1.bias.copy_(sd[prefix + "mlp.c_fc.bias"])
+        block.ffn.W2.weight.copy_(sd[prefix + "mlp.c_proj.weight"].T)
+        block.ffn.W2.bias.copy_(sd[prefix + "mlp.c_proj.bias"])
 
-    # 最终 LayerNorm
-    my_model.final_ln.weight.data = sd["transformer.ln_f.weight"]
-    my_model.final_ln.bias.data   = sd["transformer.ln_f.bias"]
+    # 最終 LayerNorm
+    my_model.ln_f.weight.copy_(sd["transformer.ln_f.weight"])
+    my_model.ln_f.bias.copy_(sd["transformer.ln_f.bias"])
 
-    # 输出头:GPT-2 的输出头和 token embedding 权重共享(weight tying)
-    my_model.output_head.weight.data = sd["transformer.wte.weight"]
+    # 輸出頭：GPT-2 的輸出頭和 token embedding 權重共享 (weight tying)
+    my_model.head.weight.copy_(sd["transformer.wte.weight"])
 
     return my_model
 
@@ -152,15 +161,18 @@ config = {
 }
 
 my_model = GPT(**config)
-
-my_model = GPT(config)
-my_model = load_gpt2_weights(my_model, hf_state_dict)
+my_model = load_gpt2_weights(my_model, hf_state_dict, n_layer=config["n_layers"])
 my_model.eval()
+hf_model.eval()
 
-input_ids = torch.tensor([[464, 3797, 15070]]) # 編碼後的 "The cat eats" 之類的範例
+tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+input_ids = tokenizer("The cat eats", return_tensors="pt").input_ids
 with torch.no_grad():
     logits = my_model(input_ids)
+    hf_logits = hf_model(input_ids).logits
 
+# 和 HuggingFace 原版比對，確認權重載入正確
+print("max diff vs HF:", (logits - hf_logits).abs().max().item())
 
 next_token_id = logits[0, -1].argmax().item()
-print(next_token_id)  # 現在這個預測才第一次"有意義"
+print(next_token_id, repr(tokenizer.decode(next_token_id)))
