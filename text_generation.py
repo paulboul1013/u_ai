@@ -1,3 +1,4 @@
+import argparse
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 import torch
 import torch.nn as nn
@@ -45,6 +46,9 @@ class MultiHeadAttention(nn.Module):
 
         # scale dot attention
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+        # causal mask：每個 token 只能看到自己和前面的 token
+        mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device), diagonal=1)
+        scores = scores.masked_fill(mask, float('-inf'))
         attn_weights = torch.softmax(scores, dim=-1)
         attn_output = torch.matmul(attn_weights, V)
 
@@ -99,13 +103,6 @@ class GPT(nn.Module):
         return logits
 
 
-hf_model = GPT2LMHeadModel.from_pretrained("gpt2")
-hf_state_dict = hf_model.state_dict()
-
-# for name, tensor in list(hf_state_dict.items())[:5]:
-#     print(name, tensor.shape)
-
-
 @torch.no_grad()
 def load_gpt2_weights(my_model, hf_state_dict, n_layer=12):
     sd = hf_state_dict
@@ -158,11 +155,11 @@ def top_k_filter(logits, k):
     filtered_logits[indices] = values
     return filtered_logits
 
-def generate(model, input_ids, max_new_tokens, temperature=0.8, top_k=50, eos_token_id=50256):
+def generate(model, input_ids, max_new_tokens, temperature=0.8, top_k=50, eos_token_id=50256, max_seq_len=1024):
     model.eval()
     for _ in range(max_new_tokens):
         with torch.no_grad():
-            logits = model(input_ids)
+            logits = model(input_ids[:, -max_seq_len:])  # 超過 max_seq_len 時只保留最後一段
 
         logits = logits[0, -1] / temperature
         logits = top_k_filter(logits, top_k)
@@ -184,19 +181,31 @@ config = {
     "max_seq_len": 1024,   # 最大序列長度
 }
 
-my_model = GPT(**config)
-my_model = load_gpt2_weights(my_model, hf_state_dict, n_layer=config["n_layers"])
-my_model.eval()
-hf_model.eval()
+def main():
+    parser = argparse.ArgumentParser(description="用自製的 GPT-2 (124M) 接續輸入文字")
+    parser.add_argument("prompt", help="開頭文字（GPT-2 主要以英文訓練）")
+    parser.add_argument("--max-new-tokens", type=int, default=50, help="最多生成幾個 token")
+    parser.add_argument("--temperature", type=float, default=0.8, help="越高越隨機")
+    parser.add_argument("--top-k", type=int, default=50, help="只從機率前 k 名的 token 抽樣")
+    parser.add_argument("--seed", type=int, default=None, help="固定亂數種子以重現結果")
+    args = parser.parse_args()
 
-tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-input_ids = tokenizer("The cat eats", return_tensors="pt").input_ids
-with torch.no_grad():
-    logits = my_model(input_ids)
-    hf_logits = hf_model(input_ids).logits
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
 
-# 和 HuggingFace 原版比對，確認權重載入正確
-print("max diff vs HF:", (logits - hf_logits).abs().max().item())
+    hf_state_dict = GPT2LMHeadModel.from_pretrained("gpt2").state_dict()
+    my_model = GPT(**config)
+    my_model = load_gpt2_weights(my_model, hf_state_dict, n_layer=config["n_layers"])
 
-next_token_id = logits[0, -1].argmax().item()
-print(next_token_id, repr(tokenizer.decode(next_token_id)))
+    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+    input_ids = tokenizer(args.prompt, return_tensors="pt").input_ids
+    output_ids = generate(
+        my_model, input_ids, args.max_new_tokens,
+        temperature=args.temperature, top_k=args.top_k,
+        eos_token_id=tokenizer.eos_token_id, max_seq_len=config["max_seq_len"],
+    )
+    print(tokenizer.decode(output_ids[0]))
+
+
+if __name__ == "__main__":
+    main()
